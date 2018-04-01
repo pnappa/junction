@@ -277,6 +277,87 @@ public:
             // Try again in the new table.
         }
     }
+    // Lookup without creating a temporary Mutator. Returns whether it exists, and loads values. Avoids converting null vals into key types.
+    bool getInline(Key key, Value& oval) {
+        Hash hash = KeyTraits::hash(key);
+        //TURF_TRACE(ConcurrentMap_Leapfrog, 15, "[getInline] called", uptr(this), uptr(hash));
+        for (;;) {
+            typename Details::Table* table = m_root.load(turf::Consume);
+            typename Details::Cell* cell = Details::find(hash, table);
+            if (!cell) {
+                oval = Value(ValueTraits::NullValue);
+                return false;
+            }
+            Value value = cell->value.load(turf::Consume);
+            if (value != Value(ValueTraits::Redirect)) {
+                oval = value;
+                return true; // Found an existing value
+            }
+            // We've been redirected to a new table. Help with the migration.
+            //TURF_TRACE(ConcurrentMap_Leapfrog, 16, "[getInline] was redirected", uptr(table), uptr(hash));
+            table->jobCoordinator.participate();
+            // Try again in the new table.
+        }
+    }
+
+    bool exists(Key key) const {
+        Hash hash = KeyTraits::hash(key);
+        //TURF_TRACE(ConcurrentMap_Leapfrog, 15, "[exists] called", uptr(this), uptr(hash));
+        for (;;) {
+            typename Details::Table* table = m_root.load(turf::Consume);
+            typename Details::Cell* cell = Details::find(hash, table);
+            if (!cell) {
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // Insert & return desired if no value associated with the key, otherwise return old value 
+    Value getsert(Key key, Value desired) {
+        Hash hash = KeyTraits::hash(key);
+        //TURF_TRACE(ConcurrentMap_Leapfrog, 2, "[getsert] called", uptr(this), uptr(hash));
+        typename Details::Table* m_table;
+        typename Details::Cell* m_cell;
+        for (;;) {
+            m_table = this->m_root.load(turf::Consume);
+            ureg overflowIdx;
+            switch (Details::insertOrFind(hash, m_table, m_cell, overflowIdx)) { // Modifies m_cell
+                case Details::InsertResult_InsertedNew: {
+                    //TODO: CAS into value
+                    // We've inserted a new cell. Don't load m_cell->value.
+                    Value oldValue = Value(ValueTraits::NullValue);
+                    bool replaced = m_cell->value.compareExchangeStrong(oldValue, desired, turf::ConsumeRelease);
+                    if (replaced) return desired;
+                    return m_cell->value.load(turf::Consume);
+                }
+                case Details::InsertResult_AlreadyFound: {
+                    // The hash was already found in the table.
+                    Value value = m_cell->value.load(turf::Consume);
+                    if (value == Value(ValueTraits::Redirect)) {
+                        // We've encountered a Redirect value.
+                        //TURF_TRACE(ConcurrentMap_Leapfrog, 3, "[getsert] insertOrFind was redirected", uptr(m_table), uptr(m_value));
+                        break; // Help finish the migration.
+                    }
+                    // Found an existing value
+                    return value; 
+                }
+                case Details::InsertResult_Overflow: {
+                    // Unlike ConcurrentMap_Linear, we don't need to keep track of & pass a "mustDouble" flag.
+                    // Passing overflowIdx is sufficient to prevent an infinite loop here.
+                    // It defines the start of the range of cells to check while estimating total cells in use.
+                    // After the first migration, deleted keys are purged, so if we hit this line during the
+                    // second loop iteration, every cell in the range will be in use, thus the estimate will be 100%.
+                    // (Concurrent deletes could result in further iterations, but it will eventually settle.)
+                    Details::beginTableMigration(*this, m_table, overflowIdx);
+                    break;
+                }
+            }
+            // A migration has been started (either by us, or another thread). Participate until it's complete.
+            m_table->jobCoordinator.participate();
+            // Try again using the latest root.
+        }
+    }
 
     Value assign(Key key, Value desired) {
         Mutator iter(*this, key);
